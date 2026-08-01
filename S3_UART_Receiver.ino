@@ -24,10 +24,10 @@ static constexpr uint8_t kCtrlResumeJunction = 0x02;  // done tasks  resume + j
 
 // Sign confirmation: require N consecutive frames of the same sign class
 // with confidence above threshold before sending ACK_STOP.
-// Threshold is set low (120/255  47%) because int8-quantized models on
+// Threshold is set low (120/255 -> 47%) because int8-quantized models on
 // ESP32-P4 often produce subdued confidence scores.  Tune per model.
 static constexpr int kSignConfirmFrames = 5;
-static constexpr uint8_t kSignConfirmConfidence = 120;  // 120/255  47%
+static constexpr uint8_t kSignConfirmConfidence = 120;  // 120/255 -> 47%
 
 #define UartFromP4 Serial0
 #define DBG Serial
