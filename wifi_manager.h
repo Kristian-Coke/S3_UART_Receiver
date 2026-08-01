@@ -4,7 +4,7 @@
 #include <WiFi.h>
 #include <esp_wifi.h>
 
-#include "config.hpp"
+#include "config.h"
 
 class WiFiManager {
  private:
