@@ -14,6 +14,7 @@ bool WiFiManager::initialize() {
 
   const unsigned long start = millis();
   const unsigned long timeout = 15000; // wait up to 15s
+  
   while (WiFi.status() != WL_CONNECTED && millis() - start < timeout) {
     Serial.print(".");
     delay(500);
