@@ -1,7 +1,9 @@
 #include <Arduino.h>
 #include "wifi_manager.h"
 #include "model_settings.h"
+#include "config.h"
 #include <PubSubClient.h>
+#include <WiFi.h>
 
 static constexpr int kDebugBaud = 921600;
 static constexpr int kUartBaud = 921600;
@@ -14,18 +16,18 @@ static constexpr int kP4DetectThreshold = 2000;
 static constexpr uint8_t kSync0 = 0xAA;
 static constexpr uint8_t kSync1 = 0x55;
 static constexpr uint8_t kMsgTypeInference = 0x01;
-static constexpr uint8_t kMsgTypeControl   = 0x02;  // S3 → P4 control messages
+static constexpr uint8_t kMsgTypeControl   = 0x02;  // S3  P4 control messages
 
-// S3 → P4 control commands
-static constexpr uint8_t kCtrlAckStop        = 0x01;  // confirmed sign → stop TX
-static constexpr uint8_t kCtrlResumeJunction = 0x02;  // done tasks → resume + junction
+// S3  P4 control commands
+static constexpr uint8_t kCtrlAckStop        = 0x01;  // confirmed sign  stop TX
+static constexpr uint8_t kCtrlResumeJunction = 0x02;  // done tasks  resume + junction
 
 // Sign confirmation: require N consecutive frames of the same sign class
 // with confidence above threshold before sending ACK_STOP.
-// Threshold is set low (120/255 ≈ 47%) because int8-quantized models on
+// Threshold is set low (120/255  47%) because int8-quantized models on
 // ESP32-P4 often produce subdued confidence scores.  Tune per model.
 static constexpr int kSignConfirmFrames = 5;
-static constexpr uint8_t kSignConfirmConfidence = 120;  // 120/255 ≈ 47%
+static constexpr uint8_t kSignConfirmConfidence = 120;  // 120/255  47%
 
 #define UartFromP4 Serial0
 #define DBG Serial
@@ -55,6 +57,11 @@ static constexpr uint32_t kTaskDurationMs = 3000;
 
 static constexpr int kP4DetectSamples = 16;
 
+// MQTT globals
+static WiFiClient s_wifi_client;
+static PubSubClient s_mqtt_client(s_wifi_client);
+static QueueHandle_t s_mqtt_queue = nullptr;  // queue of Packet
+
 static uint8_t calc_uart_checksum(const uint8_t *data, size_t len) {
   uint8_t checksum = 0;
   for (size_t i = 0; i < len; i++) {
@@ -75,7 +82,7 @@ static void send_control_packet(uint8_t cmd) {
 
   const char *name = (cmd == kCtrlAckStop) ? "ACK_STOP" :
                      (cmd == kCtrlResumeJunction) ? "RESUME_JUNCTION" : "???";
-  DBG.printf("S3 → P4: %s (0x%02X)\n", name, cmd);
+  DBG.printf("S3 \u2192 P4: %s (0x%02X)\n", name, cmd);
 }
 
 static int read_adc_avg() {
@@ -173,6 +180,57 @@ static bool read_packet(Packet *out) {
   return false;
 }
 
+// MQTT task: connects to broker and publishes Packet objects received on s_mqtt_queue
+static void mqtt_task(void *arg) {
+  (void)arg;
+  // configure server
+  s_mqtt_client.setServer(mqtt_broker, mqtt_port);
+
+  for (;;) {
+    // Ensure WiFi is up
+    if (!WiFiManager::isConnected()) {
+      WiFiManager::checkConnectionStatus();
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;
+    }
+
+    // Connect MQTT if needed
+    if (!s_mqtt_client.connected()) {
+      DBG.println("MQTT: connecting...");
+      bool ok;
+      if (mqtt_username != nullptr && mqtt_username[0] != '\0') {
+        ok = s_mqtt_client.connect("S3_UART_Receiver", mqtt_username, mqtt_password);
+      } else {
+        ok = s_mqtt_client.connect("S3_UART_Receiver");
+      }
+      if (!ok) {
+        DBG.printf("MQTT: connect failed, rc=%d\n", s_mqtt_client.state());
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        continue;
+      }
+      DBG.println("MQTT: connected");
+    }
+
+    // Wait for packets to publish, but call loop frequently
+    Packet pkt;
+    if (xQueueReceive(s_mqtt_queue, &pkt, pdMS_TO_TICKS(500)) == pdTRUE) {
+      char payload[128];
+      const char *label = "Unknown";
+      if (pkt.label_id < kCategoryCount) label = kCategoryLabels[pkt.label_id];
+      snprintf(payload, sizeof(payload), "{\"frame\":%u,\"label\":%u,\"label_name\":\"%s\",\"confidence\":%u,\"flags\":%u}",
+               (unsigned)pkt.frame_id, (unsigned)pkt.label_id, label, (unsigned)pkt.confidence, (unsigned)pkt.flags);
+      const char *pub_topic = (topic != nullptr && topic[0] != '\0') ? topic : "s3/packets";
+      if (!s_mqtt_client.publish(pub_topic, payload)) {
+        DBG.println("MQTT: publish failed");
+      } else {
+        DBG.print("MQTT: published to "); DBG.print(pub_topic); DBG.print(": "); DBG.println(payload);
+      }
+    }
+
+    s_mqtt_client.loop();
+  }
+}
+
 static void detect_task(void *arg) {
   (void)arg;
   wait_for_p4_connected_blocking();
@@ -211,7 +269,14 @@ static void uart_task(void *arg) {
       DBG.print(" conf=");
       DBG.print(p.confidence);
 
-      // ── Sign confirmation state machine ──
+      // push packet to MQTT queue (non-blocking)
+      if (s_mqtt_queue) {
+        if (xQueueSend(s_mqtt_queue, &p, 0) != pdTRUE) {
+          DBG.println("MQTT queue full, dropping packet");
+        }
+      }
+
+      //  Sign confirmation state machine 
       // With the B-G pipeline every frame is a sign-detection frame
       // (no junction/sign phase distinction).  Confirm when the same
       // label appears for N consecutive frames with confidence above threshold.
@@ -253,7 +318,7 @@ static void uart_task(void *arg) {
             }
           }
           if (!p4_stopped)
-            DBG.println("S3: WARNING — P4 did not stop TX after 3 ACK_STOP retries!");
+            DBG.println("S3: WARNING  P4 did not stop TX after 3 ACK_STOP retries!");
 
           // Step 2: Do our tasks
           DBG.printf("S3: performing tasks (%lu ms)...\n", (unsigned long)kTaskDurationMs);
@@ -279,7 +344,7 @@ static void uart_task(void *arg) {
             }
           }
           if (!p4_resumed)
-            DBG.println("S3: WARNING — P4 did not resume TX after 3 retries!");
+            DBG.println("S3: WARNING  P4 did not resume TX after 3 retries!");
 
           // Reset for next cycle
           s_sign_confirmed = false;
@@ -288,7 +353,7 @@ static void uart_task(void *arg) {
           DBG.println("S3: cycle complete, ready for next sign");
         }
       } else {
-        // Confidence too low or different label — reset counter
+        // Confidence too low or different label  reset counter
         s_last_sign_label = 0xFF;
         s_consecutive_sign_frames = 0;
       }
@@ -324,6 +389,14 @@ void setup() {
   DBG.begin(kDebugBaud);
   vTaskDelay(pdMS_TO_TICKS(200));
   DBG.println("S3 UART receiver start");
+
+  // Create MQTT queue and task
+  s_mqtt_queue = xQueueCreate(16, sizeof(Packet));
+  if (s_mqtt_queue != nullptr) {
+    xTaskCreate(mqtt_task, "mqtt", 8192, nullptr, 2, nullptr);
+  } else {
+    DBG.println("Failed to create MQTT queue");
+  }
 
   // xTaskCreate(heartbeat_task, "hb", 4096, nullptr, 1, nullptr);
   xTaskCreate(detect_task, "detect", 4096, nullptr, 2, nullptr);
