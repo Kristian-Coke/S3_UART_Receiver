@@ -10,15 +10,25 @@ const unsigned long WiFiManager::WIFI_FAILURE_TIMEOUT = 30000;  // 30 seconds
 
 bool WiFiManager::initialize() {
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.println("Connecting to WiFi...");
+  Serial.print("Connecting to WiFi");
+
+  const unsigned long start = millis();
+  const unsigned long timeout = 15000; // wait up to 15s
+  while (WiFi.status() != WL_CONNECTED && millis() - start < timeout) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println();
 
   if (WiFi.status() == WL_CONNECTED) {
-    // Serial.println("\nConnected to WiFi network with IP Address: ");
-    // Serial.println(WiFi.localIP());
-    Serial.println("\nWiFi connected.");
+    Serial.print("WiFi connected, IP=");
+    Serial.println(WiFi.localIP());
+    wifiConnected = true;
     return true;
   } else {
-    Serial.println("Failed to connect. Status: " + String(WiFi.status()));
+    Serial.print("Failed to connect after ");
+    Serial.print((millis() - start) / 1000);
+    Serial.println("s. Status: " + String(WiFi.status()));
     return false;
   }
 }
